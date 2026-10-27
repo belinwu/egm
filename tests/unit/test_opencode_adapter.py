@@ -5,7 +5,9 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import runpy
 
 import pytest
@@ -52,18 +54,26 @@ def test_install_preserves_resources_and_native_contract(tmp_path: Path) -> None
         agent = config["agent"][ADAPTER["name"](persona)]
         assert agent["mode"] == "subagent"
         assert agent["permission"] == {
-            "*": "deny", "read": {"*": "allow", "mcp:*": "deny"},
+            "*": "deny",
+            "read": {
+                "*": "allow", "*.env": "deny", "*.env.*": "deny",
+                "*.env.example": "allow", "mcp:*": "deny",
+            },
             "glob": "allow", "grep": "allow",
             "external_directory": {"*": "deny", f"{destination / 'bundle'}/**": "allow"},
         }
         # V1 maps resource reads and both list tools to read. Last match wins.
         assert list(agent["permission"]["read"].items()) == [
-            ("*", "allow"), ("mcp:*", "deny"),
+            ("*", "allow"), ("*.env", "deny"), ("*.env.*", "deny"),
+            ("*.env.example", "allow"), ("mcp:*", "deny"),
         ]
         assert str(persona) in agent["prompt"]
         assert "Read-only Protocol" not in agent["prompt"]
     primary = config["agent"]["egm"]
     assert primary["permission"]["*"] == "ask"
+    assert list(primary["permission"]["read"].items()) == [
+        ("*", "allow"), ("*.env", "ask"), ("*.env.*", "ask"), ("*.env.example", "allow"),
+    ]
     assert set(primary["permission"]["task"]) == {"*", *set(config["agent"]) - {"egm"}}
     assert "Omit task_id" in primary["prompt"]
     assert "foreground completion" in primary["prompt"]
@@ -133,3 +143,47 @@ def test_dangling_destination_is_untouched(tmp_path: Path) -> None:
         ADAPTER["install"](destination)
     assert destination.is_symlink()
     assert not (tmp_path / "absent").exists()
+
+
+def v1_match(pattern: str, value: str) -> bool:
+    """Port of V1 Wildcard.match (anomalyco/opencode@1674747): "*" spans "/"."""
+    escaped = re.escape(pattern.replace("\\", "/")).replace(r"\*", ".*").replace(r"\?", ".")
+    flags = re.S | (re.I if os.name == "nt" else 0)
+    return re.fullmatch(escaped, value.replace("\\", "/"), flags) is not None
+
+
+def v1_read_effect(rules: dict, path: str) -> str | None:
+    effect = None
+    for pattern, action in rules.items():
+        if v1_match(pattern, path):
+            effect = action
+    return effect
+
+
+def test_required_reads_pass_env_rules(tmp_path: Path) -> None:
+    # V1 checks reads against the path relative to the worktree.
+    worktree = tmp_path / "project"
+    worktree.mkdir()
+    destination = tmp_path / "candidate"
+    config = json.loads(ADAPTER["install"](destination).read_text())
+    bundle = destination / "bundle"
+    required = [
+        bundle / "docs/opencode.md",
+        *(bundle / "agents").glob("*.md"),
+        *(bundle / "resources").rglob("*.md"),
+    ]
+    for name, agent in config["agent"].items():
+        rules = agent["permission"]["read"]
+        for path in required:
+            assert v1_read_effect(rules, os.path.relpath(path, worktree)) == "allow", (name, path)
+        secret = "ask" if name == "egm" else "deny"
+        for path in (".env", "app/.env", ".env.local", "app/.env.production", "prod.env"):
+            assert v1_read_effect(rules, path) == secret, (name, path)
+        assert v1_read_effect(rules, "app/.env.example") == "allow"
+
+
+@pytest.mark.parametrize("suffix", ["egm.env.candidate", "staging.ENV.d/candidate"])
+def test_env_matching_destination_is_rejected(tmp_path: Path, suffix: str) -> None:
+    with pytest.raises(ValueError, match="read rules"):
+        ADAPTER["install"](tmp_path / suffix)
+    assert not list(tmp_path.iterdir())

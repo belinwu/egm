@@ -38,6 +38,10 @@ def install(destination: Path) -> Path:
         c in str(destination) for c in '*?[]{}!@`$\n\r'
     ):
         raise ValueError("Installation path contains template or glob characters")
+    # Read rules match worktree-relative paths and "*" spans "/", so "*.env.*"
+    # would deny every bundle read below such a path.
+    if ".env." in str(destination).lower():
+        raise ValueError("Installation path matches the .env read rules")
     if destination.is_relative_to(ROOT):
         raise ValueError("Install outside the source tree")
     destination.mkdir(parents=True)
@@ -63,7 +67,12 @@ def install(destination: Path) -> Path:
             "mode": "subagent",
             "color": "#E86E00",
             "permission": {
-                "*": "deny", "read": {"*": "allow", "mcp:*": "deny"},
+                "*": "deny",
+                # Later rules win, so "*" alone would override OpenCode's default .env rules.
+                "read": {
+                    "*": "allow", "*.env": "deny", "*.env.*": "deny",
+                    "*.env.example": "allow", "mcp:*": "deny",
+                },
                 "glob": "allow", "grep": "allow",
                 "external_directory": {"*": "deny", f"{bundle}/**": "allow"},
             },
@@ -78,7 +87,9 @@ def install(destination: Path) -> Path:
         "mode": "primary",
         "color": "#1B6EF3",
         "permission": {
-            "*": "ask", "read": "allow", "glob": "allow", "grep": "allow",
+            "*": "ask",
+            "read": {"*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow"},
+            "glob": "allow", "grep": "allow",
             "skill": {"*": "deny", "egm-*": "allow"},
             "task": {"*": "deny", **{key: "allow" for key in agents}},
             "external_directory": {"*": "ask", f"{bundle}/**": "allow"},
